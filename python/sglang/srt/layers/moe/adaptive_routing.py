@@ -187,10 +187,16 @@ def _build_spec(topk_config: TopKConfig, num_experts: int) -> Any:
 
 
 def selection_width(topk_config: TopKConfig) -> int:
-    """Width the engine's selection must run at: ``max(K, native_k, top_k)``."""
+    """Width the engine's selection must run at: ``max(K, native_k, top_k)``.
+
+    Runs first in ``select_experts``, so unsupported configurations fail closed
+    before the engine's own routing (custom functions, fused shared experts) runs.
+    """
     policy = requested_policy()
     if policy is None:
         return topk_config.top_k
+    if id(topk_config) not in _specs:
+        _check_topk_config(topk_config)
     native_k = int(_ar.spec_overrides_from_env().get("native_k", topk_config.top_k))
     return max(policy.k or native_k, native_k, topk_config.top_k)
 
