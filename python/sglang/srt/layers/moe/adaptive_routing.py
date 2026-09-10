@@ -19,6 +19,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -71,8 +72,19 @@ def _get_tracker() -> Any:
 
 
 def _log_summary() -> None:
-    if _tracker is not None and _tracker.tokens:
-        logger.info("%s", _tracker.summary())
+    if _tracker is None or not _tracker.tokens:
+        return
+    summary = _tracker.summary()
+    try:
+        logger.info("%s", summary)
+    except Exception:  # log streams may already be closed at interpreter exit
+        pass
+    try:
+        if sys.__stderr__ is not None and not sys.__stderr__.closed:
+            sys.__stderr__.write(summary + "\n")
+            sys.__stderr__.flush()
+    except Exception:
+        pass
 
 
 def check_output_format(output_format: TopKOutputFormat) -> None:
