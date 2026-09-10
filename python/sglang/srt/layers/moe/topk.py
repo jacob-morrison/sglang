@@ -99,7 +99,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe import adaptive_routing, get_moe_runner_backend
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
 )
@@ -493,6 +493,7 @@ class TopK(MultiPlatformOp):
         else:
             output_format = TopKOutputFormat.STANDARD
 
+        adaptive_routing.check_output_format(output_format)
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False
             routing_data, gather_idx, scatter_idx = routing(
@@ -1957,7 +1958,8 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-    top_k = topk_config.top_k
+    # adaptive-compute K policies run the selection at max(K, native_k) and narrow below.
+    top_k = adaptive_routing.selection_width(topk_config)
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
     num_expert_group = topk_config.num_expert_group
@@ -2125,6 +2127,10 @@ def select_experts(
             topk=num_routed_topk if _use_aiter else top_k,
             renormalize=renormalize,
         )
+
+    topk_weights, topk_ids = adaptive_routing.apply_policy(
+        topk_weights, topk_ids, router_logits, topk_config, layer_id
+    )
 
     simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
     simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
