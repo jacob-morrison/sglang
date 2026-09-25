@@ -125,6 +125,10 @@ class TritonRunnerCore(MoeRunnerCore):
             self.config.num_experts is None
             or self.config.num_experts != self.config.num_local_experts
         )
+        # adaptive-compute study: per-row reduced dispatch marks dropped expert slots with id -1 (see
+        # adaptive_routing.ROW_K_SKIP); the expert-parallel filter path skips those blocks.
+        if __import__("os").environ.get("ADAPTIVE_ROUTING_ROW_K_SKIP", "0") == "1":
+            filter_expert = True
 
         out = _fused_moe_kernel_sequence(
             runner_input.hidden_states,

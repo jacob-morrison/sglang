@@ -250,6 +250,10 @@ def fused_experts(
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    # adaptive-compute study: per-row reduced dispatch marks dropped expert slots with id -1 (see
+    # adaptive_routing.ROW_K_SKIP); the expert-parallel filter path skips those blocks.
+    if __import__("os").environ.get("ADAPTIVE_ROUTING_ROW_K_SKIP", "0") == "1":
+        filter_expert = True
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         inplace_fused_experts(
