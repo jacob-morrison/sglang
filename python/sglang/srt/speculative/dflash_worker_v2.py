@@ -654,24 +654,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         Full-vocab logits via a TP all-gather of the local shard (trace only; not on the serving path)."""
         weight = lm_head.weight
         hs = hidden_states if hidden_states.dtype == weight.dtype else hidden_states.to(weight.dtype)
-        local = torch.matmul(hs, weight.T).float()                      # [n, local_vocab_padded]
-        if hasattr(lm_head, "shard_indices"):
-            shard = lm_head.shard_indices
-            local = local[:, : int(shard.num_org_elements)]             # drop padding / added vocab
-            tp_group = get_tp_group()
-            if int(tp_group.world_size) > 1:
-                parts = [torch.empty_like(local) for _ in range(int(tp_group.world_size))]
-                torch.distributed.all_gather(parts, local, group=tp_group.device_group)
-                local = torch.cat(parts, dim=1)
-        lp = torch.log_softmax(local, dim=-1)
-        top2 = lp.topk(2, dim=-1).values
-        p = lp.exp()
-        ent = -(p * lp).sum(-1)
-        return {"draft_top1_logp": top2[:, 0], "draft_margin": top2[:, 0] - top2[:, 1], "draft_entropy": ent}
+        tp_group = get_tp_group()
+        world = int(tp_group.world_size)
+        num_org = int(lm_head.shard_indices.num_org_elements) if hasattr(lm_head, "shard_indices") else None
+        top1, margin, ent = [], [], []
+        # Chunk over rows: the full-vocab fp32 logits for a whole batch (bs*(B-1) x vocab) do not fit
+        # next to a 0.85 static pool and silently OOMed (rows lost their draft stats) in the first runs.
+        # Every rank sees the same n, so the all-gather count matches across ranks.
+        for start in range(0, hs.shape[0], 16):
+            local = torch.matmul(hs[start : start + 16], weight.T).float()  # [c, local_vocab_padded]
+            if num_org is not None:
+                local = local[:, :num_org]                                  # drop padding / added vocab
+                if world > 1:
+                    parts = [torch.empty_like(local) for _ in range(world)]
+                    torch.distributed.all_gather(parts, local, group=tp_group.device_group)
+                    local = torch.cat(parts, dim=1)
+            lp = torch.log_softmax(local, dim=-1)
+            del local
+            t2 = lp.topk(2, dim=-1).values
+            top1.append(t2[:, 0]); margin.append(t2[:, 0] - t2[:, 1])
+            ent.append(-(lp.exp() * lp).sum(-1))
+            del lp
+        return {"draft_top1_logp": torch.cat(top1), "draft_margin": torch.cat(margin), "draft_entropy": torch.cat(ent)}
 
     def _trace_write(self, batch, positions, candidates, accept_len, draft_stats, target_logits):
         """One JSON line per (request, block): committed prefix position, draft tokens, draft confidence,
-        target log p(draft token) and target margin/entropy at each block position, accepted count."""
+        target log p(draft token) per drafted slot (B-1 entries), target top-1/margin/entropy per block index
+        (B entries; index i describes the target's distribution for slot i+1), accepted count."""
         if self.tp_rank != 0:
             return
         try:
@@ -682,7 +691,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             tlp = torch.log_softmax(target_logits.float(), dim=-1).view(bs, B, -1)     # verify logits (after sampling adjustments)
             t_top2 = tlp.topk(2, dim=-1).values
             t_ent = -(tlp.exp() * tlp).sum(-1)
-            t_lp_draft = tlp.gather(2, candidates.view(bs, B, 1)).squeeze(2)          # log p_target(draft token) at each position
+            # verify logits at block index i are the target's distribution for slot i+1, so the drafted token at
+            # slot j (1..B-1) is scored by index j-1; the result has B-1 entries aligned with `draft`
+            t_lp_draft = tlp[:, :-1].gather(2, candidates[:, 1:].reshape(bs, B - 1, 1)).squeeze(2)
             pos0 = positions.view(bs, B)[:, 0].tolist()
             acc = accept_len.tolist()
             d = {k: v.view(bs, B - 1).tolist() for k, v in draft_stats.items()} if draft_stats else {}
