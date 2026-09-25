@@ -132,6 +132,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._trace_path = os.environ.get("DFLASH_TRACE_PATH", "")
         self._trace_fh = None
         self._trace_rows = 0
+        # Drafter-gated verification (adaptive-compute study): DFLASH_GATE="base=2,esc=8,signal=entropy,thr=1.33,n=3,cap=15".
+        # Each verify row gets its own expert count: rows whose drafted slot the drafter is unsure about
+        # (signal past thr), limited to the first n such slots per block and to slots <= cap, run at `esc`;
+        # all other rows (and the final bonus row, which has no draft) run at `base`. thr=inf gives a
+        # fixed-K verifier at `base`. Needs ADAPTIVE_ROUTING_POLICY=reference, MASKED=1, K=native.
+        self._gate = self._parse_gate(os.environ.get("DFLASH_GATE", ""))
+        self._row_k_buf = None
+        self._gate_stats = {"blocks": 0, "rows": 0, "sum_k": 0.0, "escalated": 0}
 
         # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
@@ -285,7 +293,53 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
 
+    @staticmethod
+    def _parse_gate(text: str):
+        if not text.strip():
+            return None
+        g = {"base": 2, "esc": 8, "signal": "entropy", "thr": float("inf"), "n": 15, "cap": 15}
+        for part in text.split(","):
+            k, v = part.split("=")
+            k = k.strip(); v = v.strip()
+            g[k] = v if k == "signal" else (float(v) if k == "thr" else int(v))
+        if g["signal"] not in ("entropy", "margin", "top1"):
+            raise ValueError(f"DFLASH_GATE signal must be entropy|margin|top1, got {g['signal']}")
+        return g
+
+    def _install_row_k(self):
+        """Static per-row K buffer, read by the MoE routing overlay in every target forward (captured
+        graphs included). Filled with the native K except during a gated verify forward. Sized for the
+        largest forward (prefill chunks) so the overlay never sees fewer rows than tokens."""
+        from sglang.srt.layers.moe import adaptive_routing
+        native_k = int(os.environ.get("ADAPTIVE_ROUTING_NATIVE_K", "0") or self._gate["esc"])
+        rows = max(int(self.server_args.chunked_prefill_size or 0), int(self.server_args.max_prefill_tokens or 0),
+                   int(self.server_args.max_running_requests or 0) * int(self.block_size) * 2, 1 << 16)
+        self._row_k_buf = torch.full((rows,), native_k, dtype=torch.int32, device=self.device)
+        self._row_k_native = native_k
+        adaptive_routing.set_row_k(self._row_k_buf)
+        if self.tp_rank == 0:
+            logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d", self._gate, rows, native_k)
+
+    def _gate_row_k(self, draft_stats: dict, bs: int) -> torch.Tensor:
+        """Per-row K for the verify block, [bs, B]. Verify row r produces the distribution for slot r+1, so
+        row r takes the decision for drafted slot r+1 (draft stats index r); the last row (final bonus) is base."""
+        g = self._gate; B = int(self.block_size)
+        if g["signal"] == "entropy":
+            unc = draft_stats["draft_entropy"].view(bs, B - 1) > g["thr"]
+        elif g["signal"] == "margin":
+            unc = draft_stats["draft_margin"].view(bs, B - 1) < g["thr"]
+        else:
+            unc = draft_stats["draft_top1_logp"].view(bs, B - 1).exp() < g["thr"]
+        slot = torch.arange(1, B, device=unc.device)[None, :]
+        unc = unc & (slot <= g["cap"])
+        esc = unc & (torch.cumsum(unc.to(torch.int32), dim=1) <= g["n"])
+        k = torch.full((bs, B), g["base"], dtype=torch.int32, device=unc.device)
+        k[:, : B - 1] = torch.where(esc, g["esc"], g["base"])
+        return k
+
     def init_cuda_graphs(self):
+        if self._gate is not None:
+            self._install_row_k()
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -677,7 +731,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             del lp
         return {"draft_top1_logp": torch.cat(top1), "draft_margin": torch.cat(margin), "draft_entropy": torch.cat(ent)}
 
-    def _trace_write(self, batch, positions, candidates, accept_len, draft_stats, target_logits):
+    def _trace_write(self, batch, positions, candidates, accept_len, draft_stats, target_logits, row_k=None):
         """One JSON line per (request, block): committed prefix position, draft tokens, draft confidence,
         target log p(draft token) per drafted slot (B-1 entries), target top-1/margin/entropy per block index
         (B entries; index i describes the target's distribution for slot i+1), accepted count."""
@@ -697,11 +751,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             pos0 = positions.view(bs, B)[:, 0].tolist()
             acc = accept_len.tolist()
             d = {k: v.view(bs, B - 1).tolist() for k, v in draft_stats.items()} if draft_stats else {}
+            # live verifier distribution per row (raw logprobs; the sampling transform is applied offline
+            # exactly as for the clean labels): top-20 ids and logprobs per verify row
+            t20 = tlp.topk(20, dim=-1)
+            t20_ids = t20.indices.to(torch.int32).cpu().numpy(); t20_lp = t20.values.cpu().numpy()
+            rk = row_k.cpu().numpy() if row_k is not None else None
             for i in range(bs):
                 rid = getattr(batch.reqs[i], "rid", None) if batch.reqs is not None and i < len(batch.reqs) else None
                 row = {"rid": rid, "pos0": int(pos0[i]), "accept_len": int(acc[i]), "draft": candidates[i, 1:].tolist(),
                        "t_logp_draft": t_lp_draft[i, :].tolist(), "t_top1_logp": t_top2[i, :, 0].tolist(),
-                       "t_margin": (t_top2[i, :, 0] - t_top2[i, :, 1]).tolist(), "t_entropy": t_ent[i, :].tolist()}
+                       "t_margin": (t_top2[i, :, 0] - t_top2[i, :, 1]).tolist(), "t_entropy": t_ent[i, :].tolist(),
+                       "t_top20_ids": t20_ids[i].tolist(), "t_top20_logp": [[round(float(x), 4) for x in r] for r in t20_lp[i]]}
+                if rk is not None:
+                    row["row_k"] = rk[i].tolist()
                 for k, v in d.items():
                     row[k] = v[i]
                 self._trace_fh.write(_json.dumps(row) + "\n")
@@ -1581,7 +1643,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
         _trace_draft = None
-        if self._trace_path:
+        _row_k = None
+        if self._trace_path or self._gate is not None:
             try:
                 _dh = draft_logits_output.hidden_states
                 if _dh is not None:
@@ -1589,6 +1652,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     _trace_draft = self._trace_draft_stats(_dh, lm_head)
             except Exception as e:
                 logger.warning("DFLASH trace (draft stats) failed: %s", e)
+            if self._gate is not None:
+                if _trace_draft is None:
+                    raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
+                _row_k = self._gate_row_k(_trace_draft, bs)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1630,12 +1697,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        if _row_k is not None:
+            flat = _row_k.reshape(-1)
+            self._row_k_buf[: flat.numel()].copy_(flat)
+            self._gate_stats["blocks"] += bs; self._gate_stats["rows"] += int(flat.numel())
+            self._gate_stats["sum_k"] += float(flat.sum()); self._gate_stats["escalated"] += int((flat == self._gate["esc"]).sum())
+        try:
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
+        finally:
+            if _row_k is not None:
+                self._row_k_buf[: _row_k.numel()].fill_(self._row_k_native)
+        if _row_k is not None and self._gate_stats["blocks"] % 20000 < bs and self.tp_rank == 0:
+            st = self._gate_stats
+            logger.info("DFLASH gate: %d blocks, mean K per verify row %.3f, escalated rows %.3f", st["blocks"], st["sum_k"] / max(st["rows"], 1), st["escalated"] / max(st["rows"], 1))
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -1669,7 +1748,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
             if self._trace_path:
-                self._trace_write(batch, positions, candidates, accept_len, _trace_draft, logits_output.next_token_logits)
+                self._trace_write(batch, positions, candidates, accept_len, _trace_draft, logits_output.next_token_logits, _row_k)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)

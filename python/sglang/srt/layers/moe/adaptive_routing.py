@@ -201,6 +201,46 @@ def selection_width(topk_config: TopKConfig) -> int:
     return max(policy.k or native_k, native_k, topk_config.top_k)
 
 
+# Per-row K (drafter-gated verification): a device int32 vector with one K per token row of the
+# current forward, set by the speculative worker right before the target's verify forward and
+# cleared right after, so prefill / decode outside that window run the plain policy. Requires a
+# masked policy at native width (the row mask zeroes the weights past K_row; expert ids keep their
+# native width, so this is a fidelity mechanism, not reduced dispatch - see ROW_K_SKIP below).
+_row_k: Optional[torch.Tensor] = None
+_row_k_stats = {"rows": 0, "sum_k": 0.0, "calls": 0}
+
+
+def set_row_k(row_k: Optional[torch.Tensor]) -> None:
+    """Install (or clear, with None) the per-row K vector for the forward that follows."""
+    global _row_k
+    _row_k = row_k
+
+
+def row_k_stats() -> dict:
+    return dict(_row_k_stats)
+
+
+def _apply_row_k(weights: torch.Tensor, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero the weights of the slots at or past each row's K. With ROW_K_SKIP=1 also set those
+    slots' expert ids to -1, which the Triton runner's expert-parallel filter skips (real reduced
+    dispatch; validated separately)."""
+    row_k = _row_k
+    if row_k is None:
+        return weights, ids
+    m = weights.shape[0]
+    if row_k.shape[0] < m:
+        raise RuntimeError(f"adaptive routing: row K vector has {row_k.shape[0]} rows, forward has {m}")
+    keep = torch.arange(weights.shape[1], device=weights.device)[None, :] < row_k[:m, None]
+    weights = weights * keep.to(weights.dtype)
+    if os.environ.get("ADAPTIVE_ROUTING_ROW_K_SKIP", "0") == "1":
+        ids = torch.where(keep, ids, torch.full_like(ids, -1))
+    if not _is_capturing():
+        _row_k_stats["rows"] += m
+        _row_k_stats["sum_k"] += float(row_k[:m].sum())
+        _row_k_stats["calls"] += 1
+    return weights, ids
+
+
 def apply_policy(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -211,6 +251,8 @@ def apply_policy(
     """Narrow the engine's selection to the policy's K. No-op when no policy is set."""
     policy = requested_policy()
     if policy is None:
+        if _row_k is not None:
+            raise RuntimeError("adaptive routing: per-row K needs ADAPTIVE_ROUTING_POLICY=reference with MASKED=1")
         return topk_weights, topk_ids
     key = id(topk_config)
     spec = _specs.get(key)
@@ -255,6 +297,10 @@ def apply_policy(
                 new_ids.shape[0],
                 new_ids.shape[-1],
             )
+    if _row_k is not None:
+        if not policy.masked:
+            raise RuntimeError("adaptive routing: per-row K needs a masked (native-width) policy")
+        new_weights, new_ids = _apply_row_k(new_weights, new_ids)
     if os.environ.get("ADAPTIVE_ROUTING_TELEMETRY", "1") != "0":
         _get_tracker().record_fixed(state["index"], k, new_ids.shape[0])
     state["calls"] += 1
