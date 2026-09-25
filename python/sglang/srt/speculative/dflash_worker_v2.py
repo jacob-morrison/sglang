@@ -1,4 +1,5 @@
 import logging
+import os
 import math
 from typing import List, Optional
 
@@ -127,6 +128,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        # Per-block draft/verify trace (adaptive-compute study): DFLASH_TRACE_PATH=<file.jsonl>, rank 0 only.
+        self._trace_path = os.environ.get("DFLASH_TRACE_PATH", "")
+        self._trace_fh = None
+        self._trace_rows = 0
 
         # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
@@ -643,6 +648,57 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         return int(resolved_id)
+
+    def _trace_draft_stats(self, hidden_states: torch.Tensor, lm_head) -> dict:
+        """Draft-head confidence per drafted position: top-1 prob, top-1 minus top-2 logit, entropy.
+        Full-vocab logits via a TP all-gather of the local shard (trace only; not on the serving path)."""
+        weight = lm_head.weight
+        hs = hidden_states if hidden_states.dtype == weight.dtype else hidden_states.to(weight.dtype)
+        local = torch.matmul(hs, weight.T).float()                      # [n, local_vocab_padded]
+        if hasattr(lm_head, "shard_indices"):
+            shard = lm_head.shard_indices
+            local = local[:, : int(shard.num_org_elements)]             # drop padding / added vocab
+            tp_group = get_tp_group()
+            if int(tp_group.world_size) > 1:
+                parts = [torch.empty_like(local) for _ in range(int(tp_group.world_size))]
+                torch.distributed.all_gather(parts, local, group=tp_group.device_group)
+                local = torch.cat(parts, dim=1)
+        lp = torch.log_softmax(local, dim=-1)
+        top2 = lp.topk(2, dim=-1).values
+        p = lp.exp()
+        ent = -(p * lp).sum(-1)
+        return {"draft_top1_logp": top2[:, 0], "draft_margin": top2[:, 0] - top2[:, 1], "draft_entropy": ent}
+
+    def _trace_write(self, batch, positions, candidates, accept_len, draft_stats, target_logits):
+        """One JSON line per (request, block): committed prefix position, draft tokens, draft confidence,
+        target log p(draft token) and target margin/entropy at each block position, accepted count."""
+        if self.tp_rank != 0:
+            return
+        try:
+            import json as _json
+            if self._trace_fh is None:
+                self._trace_fh = open(self._trace_path, "a")
+            bs, B = candidates.shape
+            tlp = torch.log_softmax(target_logits.float(), dim=-1).view(bs, B, -1)     # verify logits (after sampling adjustments)
+            t_top2 = tlp.topk(2, dim=-1).values
+            t_ent = -(tlp.exp() * tlp).sum(-1)
+            t_lp_draft = tlp.gather(2, candidates.view(bs, B, 1)).squeeze(2)          # log p_target(draft token) at each position
+            pos0 = positions.view(bs, B)[:, 0].tolist()
+            acc = accept_len.tolist()
+            d = {k: v.view(bs, B - 1).tolist() for k, v in draft_stats.items()} if draft_stats else {}
+            for i in range(bs):
+                rid = getattr(batch.reqs[i], "rid", None) if batch.reqs is not None and i < len(batch.reqs) else None
+                row = {"rid": rid, "pos0": int(pos0[i]), "accept_len": int(acc[i]), "draft": candidates[i, 1:].tolist(),
+                       "t_logp_draft": t_lp_draft[i, :].tolist(), "t_top1_logp": t_top2[i, :, 0].tolist(),
+                       "t_margin": (t_top2[i, :, 0] - t_top2[i, :, 1]).tolist(), "t_entropy": t_ent[i, :].tolist()}
+                for k, v in d.items():
+                    row[k] = v[i]
+                self._trace_fh.write(_json.dumps(row) + "\n")
+            self._trace_rows += bs
+            if self._trace_rows % 2000 < bs:
+                self._trace_fh.flush()
+        except Exception as e:  # tracing must never break serving
+            logger.warning("DFLASH trace failed: %s", e)
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1513,6 +1569,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        _trace_draft = None
+        if self._trace_path:
+            try:
+                _dh = draft_logits_output.hidden_states
+                if _dh is not None:
+                    _dh = _dh.view(bs, int(self.block_size), -1)[:, 1:, :].reshape(-1, _dh.shape[-1])
+                    _trace_draft = self._trace_draft_stats(_dh, lm_head)
+            except Exception as e:
+                logger.warning("DFLASH trace (draft stats) failed: %s", e)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1592,6 +1657,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out_tokens[:, : int(self.block_size) - 1].copy_(candidates[:, 1:])
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+            if self._trace_path:
+                self._trace_write(batch, positions, candidates, accept_len, _trace_draft, logits_output.next_token_logits)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, int(self.block_size)
