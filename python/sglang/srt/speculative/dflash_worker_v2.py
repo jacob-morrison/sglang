@@ -734,6 +734,49 @@ class DFlashWorkerV2(BaseSpecWorker):
             del lp
         return {"draft_top1_logp": torch.cat(top1), "draft_margin": torch.cat(margin), "draft_entropy": torch.cat(ent)}
 
+    def _draft_head_stats(self, hidden_states: torch.Tensor, lm_head, chunk_size: int = 256):
+        """Draft argmax plus per-position confidence (top-1 logprob, top-1 minus top-2 logit margin, full-vocab
+        entropy) from one pass over the local lm_head shard, without gathering full-vocab logits: each rank
+        reduces its shard to [max, argmax, top-2 values, sum exp(l-max), sum exp(l-max)*l] and the ranks
+        combine those small vectors. Returns (tokens[long], stats) or None when the head has added vocab
+        (then the caller uses the generic argmax + chunked full-vocab stats)."""
+        weight = lm_head.weight
+        if hidden_states.numel() == 0:
+            z = torch.empty((0,), device=hidden_states.device)
+            return torch.empty((0,), dtype=torch.long, device=hidden_states.device), {"draft_top1_logp": z, "draft_margin": z, "draft_entropy": z}
+        if hasattr(lm_head, "shard_indices"):
+            shard = lm_head.shard_indices
+            if int(shard.num_added_elements) != 0:
+                return None
+            num_org = int(shard.num_org_elements); org_start = int(shard.org_vocab_start_index)
+        else:
+            num_org = int(weight.shape[0]); org_start = 0
+        tp_group = get_tp_group(); world = int(tp_group.world_size)
+        hs_all = hidden_states if hidden_states.dtype == weight.dtype else hidden_states.to(weight.dtype)
+        toks, top1, margin, ent = [], [], [], []
+        for start in range(0, hs_all.shape[0], chunk_size):
+            logits = torch.matmul(hs_all[start : start + chunk_size], weight[:num_org].T).float()   # [c, local_vocab]
+            m, arg = logits.max(dim=-1)
+            t2 = logits.topk(2, dim=-1).values
+            e = torch.exp(logits - m[:, None])
+            part = torch.stack([m, t2[:, 0], t2[:, 1], e.sum(-1), (e * logits).sum(-1), (arg + org_start).float()], dim=1)   # [c, 6]
+            if world > 1:
+                parts = [torch.empty_like(part) for _ in range(world)]
+                torch.distributed.all_gather(parts, part, group=tp_group.device_group)
+                P = torch.stack(parts, dim=0)                                          # [world, c, 6]
+            else:
+                P = part[None]
+            M = P[:, :, 0].max(dim=0).values                                             # global max logit
+            scale = torch.exp(P[:, :, 0] - M[None])
+            Z = (P[:, :, 3] * scale).sum(0); T = (P[:, :, 4] * scale).sum(0)
+            logZ = M + torch.log(Z)
+            cand = torch.cat([P[:, :, 1], P[:, :, 2]], dim=0).T                          # [c, 2*world] top-2 candidates
+            g2 = cand.topk(2, dim=-1).values
+            best_rank = P[:, :, 1].argmax(dim=0)                                         # rank holding the global max
+            toks.append(P[best_rank, torch.arange(P.shape[1], device=P.device), 5].long())
+            top1.append(g2[:, 0] - logZ); margin.append(g2[:, 0] - g2[:, 1]); ent.append(logZ - T / Z)
+        return torch.cat(toks), {"draft_top1_logp": torch.cat(top1), "draft_margin": torch.cat(margin), "draft_entropy": torch.cat(ent)}
+
     def _trace_write(self, batch, positions, candidates, accept_len, draft_stats, target_logits, row_k=None):
         """One JSON line per (request, block): committed prefix position, draft tokens, draft confidence,
         target log p(draft token) per drafted slot (B-1 entries), target top-1/margin/entropy per block index
@@ -1626,6 +1669,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
+        _head_stats = None
         if self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
@@ -1635,12 +1679,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
+            _head_stats = None
+            if self._trace_path or self._gate is not None:
+                _head_stats = self._draft_head_stats(draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]), lm_head)
+            if _head_stats is not None:
+                draft_next = _head_stats[0].view(bs, int(self.block_size) - 1)
+            else:
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=draft_hidden[:, 1:, :].reshape(
+                        -1, draft_hidden.shape[-1]
+                    ),
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1648,13 +1698,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         _trace_draft = None
         _row_k = None
         if self._trace_path or self._gate is not None:
-            try:
-                _dh = draft_logits_output.hidden_states
-                if _dh is not None:
-                    _dh = _dh.view(bs, int(self.block_size), -1)[:, 1:, :].reshape(-1, _dh.shape[-1])
-                    _trace_draft = self._trace_draft_stats(_dh, lm_head)
-            except Exception as e:
-                logger.warning("DFLASH trace (draft stats) failed: %s", e)
+            if self._draft_sampler is None and _head_stats is not None:
+                _trace_draft = _head_stats[1]                      # sharded reduction, computed with the argmax above
+            else:
+                try:
+                    _dh = draft_logits_output.hidden_states
+                    if _dh is not None:
+                        _dh = _dh.view(bs, int(self.block_size), -1)[:, 1:, :].reshape(-1, _dh.shape[-1])
+                        _trace_draft = self._trace_draft_stats(_dh, lm_head)
+                except Exception as e:
+                    logger.warning("DFLASH trace (draft stats) failed: %s", e)
             if self._gate is not None:
                 if _trace_draft is None:
                     raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
