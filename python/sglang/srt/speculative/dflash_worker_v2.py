@@ -140,6 +140,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._gate = self._parse_gate(os.environ.get("DFLASH_GATE", ""))
         self._row_k_buf = None
         self._gate_stats = {"blocks": 0, "rows": 0, "sum_k": 0.0, "escalated": 0}
+        if self._gate is not None:
+            self._install_row_k()
 
         # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
@@ -312,13 +314,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         largest forward (prefill chunks) so the overlay never sees fewer rows than tokens."""
         from sglang.srt.layers.moe import adaptive_routing
         native_k = int(os.environ.get("ADAPTIVE_ROUTING_NATIVE_K", "0") or self._gate["esc"])
-        rows = max(int(self.server_args.chunked_prefill_size or 0), int(self.server_args.max_prefill_tokens or 0),
-                   int(self.server_args.max_running_requests or 0) * int(self.block_size) * 2, 1 << 16)
-        self._row_k_buf = torch.full((rows,), native_k, dtype=torch.int32, device=self.device)
+        if os.environ.get(adaptive_routing.ROW_K_ENV, "0") != "1":
+            raise RuntimeError(f"DFLASH gate needs {adaptive_routing.ROW_K_ENV}=1 so the routing overlay allocates the row-K buffer before graph capture")
+        # the overlay allocates the buffer on its first routed batch (during warmup / capture); fetch the same object
+        self._row_k_buf = adaptive_routing.ensure_row_k(self.device, native_k)
         self._row_k_native = native_k
-        adaptive_routing.set_row_k(self._row_k_buf)
         if self.tp_rank == 0:
-            logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d", self._gate, rows, native_k)
+            logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d (allocated before capture: %s)",
+                        self._gate, self._row_k_buf.numel(), native_k, "yes" if adaptive_routing.row_k_stats()["calls"] >= 0 else "?")
 
     def _gate_row_k(self, draft_stats: dict, bs: int) -> torch.Tensor:
         """Per-row K for the verify block, [bs, B]. Verify row r produces the distribution for slot r+1, so
@@ -338,7 +341,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return k
 
     def init_cuda_graphs(self):
-        if self._gate is not None:
+        if self._gate is not None and self._row_k_buf is None:
             self._install_row_k()
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:

@@ -208,12 +208,29 @@ def selection_width(topk_config: TopKConfig) -> int:
 # native width, so this is a fidelity mechanism, not reduced dispatch - see ROW_K_SKIP below).
 _row_k: Optional[torch.Tensor] = None
 _row_k_stats = {"rows": 0, "sum_k": 0.0, "calls": 0}
+ROW_K_ENV = "ADAPTIVE_ROUTING_ROW_K"          # "1": allocate the per-row K buffer on first use (before any graph capture)
+ROW_K_ROWS_ENV = "ADAPTIVE_ROUTING_ROW_K_ROWS"  # buffer rows (>= tokens of the largest forward); default 131072
 
 
 def set_row_k(row_k: Optional[torch.Tensor]) -> None:
     """Install (or clear, with None) the per-row K vector for the forward that follows."""
     global _row_k
     _row_k = row_k
+
+
+def ensure_row_k(device, native_k: int) -> torch.Tensor:
+    """Allocate the static per-row K buffer (filled with the native K) if it does not exist yet, and
+    install it. Called from apply_policy on the first routed batch when ROW_K_ENV=1, so the buffer
+    exists before any CUDA graph is captured and every captured graph reads it; the speculative
+    worker fetches the same buffer and writes its per-row Ks into it before each verify forward."""
+    global _row_k
+    if _row_k is None:
+        if _is_capturing():
+            raise RuntimeError("adaptive routing: per-row K buffer requested during CUDA graph capture; it must be allocated by an eager (warmup) forward first")
+        rows = int(os.environ.get(ROW_K_ROWS_ENV, str(1 << 17)))
+        _row_k = torch.full((rows,), int(native_k), dtype=torch.int32, device=device)
+        logger.info("adaptive routing: per-row K buffer allocated, %d rows at native K=%d", rows, native_k)
+    return _row_k
 
 
 def row_k_stats() -> dict:
@@ -278,6 +295,8 @@ def apply_policy(
     state = _state[key]
     first = state["calls"] == 0 and not _is_capturing()
     k = policy.resolve_k(spec)
+    if _row_k is None and os.environ.get(ROW_K_ENV, "0") == "1":
+        ensure_row_k(topk_weights.device, spec.native_k)
     if state["from_logits"]:
         bias = topk_config.correction_bias
         out = _ar.route(router_logits, spec, policy, selection_bias=bias)
