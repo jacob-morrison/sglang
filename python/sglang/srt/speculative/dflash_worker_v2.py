@@ -300,11 +300,16 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _parse_gate(text: str):
         if not text.strip():
             return None
-        g = {"base": 2, "esc": 8, "signal": "entropy", "thr": float("inf"), "n": 15, "cap": 15}
+        g = {"base": 2, "esc": 8, "signal": "entropy", "thr": float("inf"), "n": 15, "cap": 15, "tiers": None}
         for part in text.split(","):
             k, v = part.split("=")
             k = k.strip(); v = v.strip()
-            g[k] = v if k == "signal" else (float(v) if k == "thr" else int(v))
+            if k == "tiers":
+                # position tiers "8@3;3@7;1@15": slots <= 3 at K=8, slots 4..7 at K=3, slots 8..15 at K=1; final row at base.
+                # Purely positional (no drafter signal, no stats); overrides thr/n/cap.
+                g["tiers"] = sorted(((int(a.split("@")[1]), int(a.split("@")[0])) for a in v.split(";")), key=lambda x: x[0])
+            else:
+                g[k] = v if k == "signal" else (float(v) if k == "thr" else int(v))
         if g["signal"] not in ("entropy", "margin", "top1"):
             raise ValueError(f"DFLASH_GATE signal must be entropy|margin|top1, got {g['signal']}")
         return g
@@ -324,10 +329,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d (allocated before capture: %s)",
                         self._gate, self._row_k_buf.numel(), native_k, "yes" if adaptive_routing.row_k_stats()["calls"] >= 0 else "?")
 
+    def _tier_row_k(self, bs: int) -> torch.Tensor:
+        """Position tiers: K by drafted slot (verify row r <-> slot r+1); the final row runs at the base K."""
+        g = self._gate; B = int(self.block_size)
+        k = torch.full((bs, B), g["base"], dtype=torch.int32, device=self.device)
+        slot = torch.arange(1, B, device=self.device)
+        kk = torch.full((B - 1,), g["base"], dtype=torch.int32, device=self.device)
+        for slot_max, kval in reversed(g["tiers"]):       # larger tiers first, then smaller ones overwrite
+            kk = torch.where(slot <= slot_max, torch.tensor(kval, dtype=torch.int32, device=self.device), kk)
+        k[:, : B - 1] = kk[None, :]
+        return k
+
     def _gate_row_k(self, draft_stats: dict, bs: int) -> torch.Tensor:
         """Per-row K for the verify block, [bs, B]. Verify row r produces the distribution for slot r+1, so
         row r takes the decision for drafted slot r+1 (draft stats index r); the last row (final bonus) is base."""
         g = self._gate; B = int(self.block_size)
+        if g.get("tiers"):
+            return self._tier_row_k(bs)
         if g["signal"] == "entropy":
             unc = draft_stats["draft_entropy"].view(bs, B - 1) > g["thr"]
         elif g["signal"] == "margin":
@@ -1681,7 +1699,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             _head_stats = None
-            if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"])):
+            if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"]) and not self._gate.get("tiers")):
                 _head_stats = self._draft_head_stats(draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]), lm_head)
             if _head_stats is not None:
                 draft_next = _head_stats[0].view(bs, int(self.block_size) - 1)
@@ -1698,7 +1716,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 1:].copy_(draft_next)
         _trace_draft = None
         _row_k = None
-        if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"])):
+        if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"]) and not self._gate.get("tiers")):
             if self._draft_sampler is None and _head_stats is not None:
                 _trace_draft = _head_stats[1]                      # sharded reduction, computed with the argmax above
             else:
@@ -1710,7 +1728,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 except Exception as e:
                     logger.warning("DFLASH trace (draft stats) failed: %s", e)
             if self._gate is not None:
-                if not math.isfinite(self._gate["thr"]):
+                if self._gate.get("tiers"):
+                    _row_k = self._tier_row_k(bs)
+                elif not math.isfinite(self._gate["thr"]):
                     # fixed-K verification: every row at the base K (or all escalated for thr=-inf); no stats needed
                     k_all = self._gate["esc"] if self._gate["thr"] < 0 and self._gate["n"] >= int(self.block_size) else self._gate["base"]
                     _row_k = self._gate_row_k(_trace_draft, bs) if _trace_draft is not None else torch.full((bs, int(self.block_size)), k_all, dtype=torch.int32, device=self.device)
