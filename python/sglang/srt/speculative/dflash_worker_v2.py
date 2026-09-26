@@ -142,6 +142,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._gate_stats = {"blocks": 0, "rows": 0, "sum_k": 0.0, "escalated": 0}
         if self._gate is not None:
             self._install_row_k()
+        self._gate_acc = None          # device accumulators [sum K, escalated rows]; read only when logging
 
         # Draft runner (separate KV cache + attention backend).
         self._draft_worker = TpModelWorker(
@@ -1680,7 +1681,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             _head_stats = None
-            if self._trace_path or self._gate is not None:
+            if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"])):
                 _head_stats = self._draft_head_stats(draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]), lm_head)
             if _head_stats is not None:
                 draft_next = _head_stats[0].view(bs, int(self.block_size) - 1)
@@ -1697,7 +1698,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 1:].copy_(draft_next)
         _trace_draft = None
         _row_k = None
-        if self._trace_path or self._gate is not None:
+        if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"])):
             if self._draft_sampler is None and _head_stats is not None:
                 _trace_draft = _head_stats[1]                      # sharded reduction, computed with the argmax above
             else:
@@ -1709,9 +1710,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 except Exception as e:
                     logger.warning("DFLASH trace (draft stats) failed: %s", e)
             if self._gate is not None:
-                if _trace_draft is None:
-                    raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
-                _row_k = self._gate_row_k(_trace_draft, bs)
+                if not math.isfinite(self._gate["thr"]):
+                    # fixed-K verification: every row at the base K (or all escalated for thr=-inf); no stats needed
+                    k_all = self._gate["esc"] if self._gate["thr"] < 0 and self._gate["n"] >= int(self.block_size) else self._gate["base"]
+                    _row_k = self._gate_row_k(_trace_draft, bs) if _trace_draft is not None else torch.full((bs, int(self.block_size)), k_all, dtype=torch.int32, device=self.device)
+                else:
+                    if _trace_draft is None:
+                        raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
+                    _row_k = self._gate_row_k(_trace_draft, bs)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1757,7 +1763,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             flat = _row_k.reshape(-1)
             self._row_k_buf[: flat.numel()].copy_(flat)
             self._gate_stats["blocks"] += bs; self._gate_stats["rows"] += int(flat.numel())
-            self._gate_stats["sum_k"] += float(flat.sum()); self._gate_stats["escalated"] += int((flat == self._gate["esc"]).sum())
+            if self._gate_acc is None:
+                self._gate_acc = torch.zeros(2, dtype=torch.float64, device=flat.device)
+            self._gate_acc[0] += flat.sum(); self._gate_acc[1] += (flat == self._gate["esc"]).sum()   # no host sync per block
         try:
             target_out = self.target_worker.forward_batch_generation(
                 batch=None,
@@ -1769,8 +1777,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if _row_k is not None:
                 self._row_k_buf[: _row_k.numel()].fill_(self._row_k_native)
         if _row_k is not None and self._gate_stats["blocks"] % 20000 < bs and self.tp_rank == 0:
-            st = self._gate_stats
-            logger.info("DFLASH gate: %d blocks, mean K per verify row %.3f, escalated rows %.3f", st["blocks"], st["sum_k"] / max(st["rows"], 1), st["escalated"] / max(st["rows"], 1))
+            st = self._gate_stats; acc = self._gate_acc.tolist()
+            logger.info("DFLASH gate: %d blocks, mean K per verify row %.3f, escalated rows %.3f", st["blocks"], acc[0] / max(st["rows"], 1), acc[1] / max(st["rows"], 1))
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
