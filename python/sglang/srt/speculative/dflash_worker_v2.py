@@ -1716,6 +1716,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens[:, 1:].copy_(draft_next)
         _trace_draft = None
         _row_k = None
+        # Draft statistics are needed for the trace and for confidence-signal gates (finite threshold, no tiers).
+        # The row-K assignment itself must run for EVERY gate: fixed-K (thr=inf) and position tiers need no
+        # statistics. Until 2026-09-27 the assignment sat inside the statistics condition, so without a trace the
+        # fixed-K and tier arms silently verified at the native K (every untraced eval/SWE job from 2026-09-26 08:15).
         if self._trace_path or (self._gate is not None and math.isfinite(self._gate["thr"]) and not self._gate.get("tiers")):
             if self._draft_sampler is None and _head_stats is not None:
                 _trace_draft = _head_stats[1]                      # sharded reduction, computed with the argmax above
@@ -1727,17 +1731,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                         _trace_draft = self._trace_draft_stats(_dh, lm_head)
                 except Exception as e:
                     logger.warning("DFLASH trace (draft stats) failed: %s", e)
-            if self._gate is not None:
-                if self._gate.get("tiers"):
-                    _row_k = self._tier_row_k(bs)
-                elif not math.isfinite(self._gate["thr"]):
-                    # fixed-K verification: every row at the base K (or all escalated for thr=-inf); no stats needed
-                    k_all = self._gate["esc"] if self._gate["thr"] < 0 and self._gate["n"] >= int(self.block_size) else self._gate["base"]
-                    _row_k = self._gate_row_k(_trace_draft, bs) if _trace_draft is not None else torch.full((bs, int(self.block_size)), k_all, dtype=torch.int32, device=self.device)
-                else:
-                    if _trace_draft is None:
-                        raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
-                    _row_k = self._gate_row_k(_trace_draft, bs)
+        if self._gate is not None:
+            if self._gate.get("tiers"):
+                _row_k = self._tier_row_k(bs)
+            elif not math.isfinite(self._gate["thr"]):
+                # fixed-K verification: every row at the base K (or all escalated for thr=-inf); no stats needed
+                k_all = self._gate["esc"] if self._gate["thr"] < 0 and self._gate["n"] >= int(self.block_size) else self._gate["base"]
+                _row_k = torch.full((bs, int(self.block_size)), k_all, dtype=torch.int32, device=self.device)
+            else:
+                if _trace_draft is None:
+                    raise RuntimeError("DFLASH gate: draft hidden states unavailable (cuda-graph draft path); run TP>1 or disable the draft graph")
+                _row_k = self._gate_row_k(_trace_draft, bs)
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
@@ -1782,6 +1786,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if _row_k is not None:
             flat = _row_k.reshape(-1)
             self._row_k_buf[: flat.numel()].copy_(flat)
+            if not self._gate_stats.get("first_logged") and self.tp_rank == 0:
+                self._gate_stats["first_logged"] = True
+                logger.info("DFLASH gate: first verify block row K = %s (rows x %d)", _row_k[0].tolist(), int(self.block_size))
             self._gate_stats["blocks"] += bs; self._gate_stats["rows"] += int(flat.numel())
             if self._gate_acc is None:
                 self._gate_acc = torch.zeros(2, dtype=torch.float64, device=flat.device)
