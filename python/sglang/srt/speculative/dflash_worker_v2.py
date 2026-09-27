@@ -312,6 +312,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 g[k] = v if k == "signal" else (float(v) if k == "thr" else int(v))
         if g["signal"] not in ("entropy", "margin", "top1"):
             raise ValueError(f"DFLASH_GATE signal must be entropy|margin|top1, got {g['signal']}")
+        if g["tiers"] is None and g["thr"] < 0:
+            # A negative threshold flags every slot, so the rule is purely positional: the first min(n, cap) slots at esc,
+            # the rest at base. Express it as tiers so it takes the stats-free path (Codex 2026-09-27: the fast path used
+            # to turn thr=-inf with n < block size into all-base rows).
+            n_esc = max(0, min(int(g["n"]), int(g["cap"])))
+            g["tiers"] = ([(n_esc, int(g["esc"]))] if n_esc > 0 else []) + [(15, int(g["base"]))]
+            g["thr"] = float("inf")
         return g
 
     def _install_row_k(self):
