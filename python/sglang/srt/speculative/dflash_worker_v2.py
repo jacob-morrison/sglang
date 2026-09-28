@@ -183,6 +183,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self._gate is not None and self._gate.get("mode") == "hybrid":
+            self._install_hybrid_calibration()
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -342,20 +344,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         # the overlay allocates the buffer on its first routed batch (during warmup / capture); fetch the same object
         self._row_k_buf = adaptive_routing.ensure_row_k(self.device, native_k)
         self._row_k_native = native_k
-        if self._gate.get("mode") == "hybrid":
-            import json
-            with open(os.environ["DFLASH_REACH_CALIBRATION"]) as f:
-                calibration = json.load(f)
-            if calibration.get("version") != 1 or calibration["entropy_threshold"] != self._gate["thr"]:
-                raise ValueError("hybrid reach calibration version/entropy threshold mismatch")
-            table = calibration["acceptance_by_slot_bin"]
-            if (len(table) != int(self.block_size) - 1 or any(len(row) != 2 for row in table)
-                    or any(not math.isfinite(p) or not 0 <= p <= 1 for row in table for p in row)):
-                raise ValueError("hybrid reach calibration must contain one finite two-bin probability row per draft slot")
-            self._hybrid_acceptance = torch.tensor(table, dtype=torch.float32, device=self.device)
         if self.tp_rank == 0:
             logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d (allocated before capture: %s)",
                         self._gate, self._row_k_buf.numel(), native_k, "yes" if adaptive_routing.row_k_stats()["calls"] >= 0 else "?")
+
+    def _install_hybrid_calibration(self):
+        """Load reach probabilities after the draft configuration supplies block_size."""
+        import json
+        with open(os.environ["DFLASH_REACH_CALIBRATION"]) as f:
+            calibration = json.load(f)
+        if calibration.get("version") != 1 or calibration["entropy_threshold"] != self._gate["thr"]:
+            raise ValueError("hybrid reach calibration version/entropy threshold mismatch")
+        table = calibration["acceptance_by_slot_bin"]
+        if (len(table) != int(self.block_size) - 1 or any(len(row) != 2 for row in table)
+                or any(not math.isfinite(p) or not 0 <= p <= 1 for row in table for p in row)):
+            raise ValueError("hybrid reach calibration must contain one finite two-bin probability row per draft slot")
+        self._hybrid_acceptance = torch.tensor(table, dtype=torch.float32, device=self.device)
 
     def _tier_row_k(self, bs: int) -> torch.Tensor:
         """Position tiers: K by drafted slot (verify row r <-> slot r+1); the final row runs at the base K."""
