@@ -300,7 +300,8 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _parse_gate(text: str):
         if not text.strip():
             return None
-        g = {"base": 2, "esc": 8, "signal": "entropy", "thr": float("inf"), "n": 15, "cap": 15, "tiers": None}
+        g = {"base": 2, "esc": 8, "signal": "entropy", "thr": float("inf"), "n": 15, "cap": 15, "tiers": None,
+             "mode": "confidence", "protect": 2, "reach_min": 0.5}
         for part in text.split(","):
             k, v = part.split("=")
             k = k.strip(); v = v.strip()
@@ -309,9 +310,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # Purely positional (no drafter signal, no stats); overrides thr/n/cap.
                 g["tiers"] = sorted(((int(a.split("@")[1]), int(a.split("@")[0])) for a in v.split(";")), key=lambda x: x[0])
             else:
-                g[k] = v if k == "signal" else (float(v) if k == "thr" else int(v))
+                g[k] = v if k in ("signal", "mode") else (float(v) if k in ("thr", "reach_min") else int(v))
         if g["signal"] not in ("entropy", "margin", "top1"):
             raise ValueError(f"DFLASH_GATE signal must be entropy|margin|top1, got {g['signal']}")
+        if g["mode"] not in ("confidence", "hybrid"):
+            raise ValueError(f"DFLASH_GATE unknown mode {g['mode']}")
+        if g["mode"] == "hybrid":
+            if (g["signal"] != "entropy" or not math.isfinite(g["thr"]) or g["thr"] < 0
+                    or g["tiers"] is not None or g["n"] != 1
+                    or not 1 <= g["protect"] < g["cap"] <= 15
+                    or not 0 <= g["reach_min"] <= 1
+                    or not 1 <= g["base"] < g["esc"] <= 8):
+                raise ValueError("hybrid needs finite entropy threshold, one flexible escalation, valid protected prefix/cap, and 1 <= base < esc <= 8")
         if g["tiers"] is None and g["thr"] < 0:
             # A negative threshold flags every slot, so the rule is purely positional: the first min(n, cap) slots at esc,
             # the rest at base. Express it as tiers so it takes the stats-free path (Codex 2026-09-27: the fast path used
@@ -332,6 +342,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         # the overlay allocates the buffer on its first routed batch (during warmup / capture); fetch the same object
         self._row_k_buf = adaptive_routing.ensure_row_k(self.device, native_k)
         self._row_k_native = native_k
+        if self._gate.get("mode") == "hybrid":
+            import json
+            with open(os.environ["DFLASH_REACH_CALIBRATION"]) as f:
+                calibration = json.load(f)
+            if calibration.get("version") != 1 or calibration["entropy_threshold"] != self._gate["thr"]:
+                raise ValueError("hybrid reach calibration version/entropy threshold mismatch")
+            table = calibration["acceptance_by_slot_bin"]
+            if (len(table) != int(self.block_size) - 1 or any(len(row) != 2 for row in table)
+                    or any(not math.isfinite(p) or not 0 <= p <= 1 for row in table for p in row)):
+                raise ValueError("hybrid reach calibration must contain one finite two-bin probability row per draft slot")
+            self._hybrid_acceptance = torch.tensor(table, dtype=torch.float32, device=self.device)
         if self.tp_rank == 0:
             logger.info("DFLASH gate %s installed: row-K buffer of %d rows at native K=%d (allocated before capture: %s)",
                         self._gate, self._row_k_buf.numel(), native_k, "yes" if adaptive_routing.row_k_stats()["calls"] >= 0 else "?")
@@ -351,6 +372,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Per-row K for the verify block, [bs, B]. Verify row r produces the distribution for slot r+1, so
         row r takes the decision for drafted slot r+1 (draft stats index r); the last row (final bonus) is base."""
         g = self._gate; B = int(self.block_size)
+        if g.get("mode") == "hybrid":
+            return self._hybrid_row_k(draft_stats, bs)
         if g.get("tiers"):
             return self._tier_row_k(bs)
         if g["signal"] == "entropy":
@@ -364,6 +387,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         esc = unc & (torch.cumsum(unc.to(torch.int32), dim=1) <= g["n"])
         k = torch.full((bs, B), g["base"], dtype=torch.int32, device=unc.device)
         k[:, : B - 1] = torch.where(esc, g["esc"], g["base"])
+        return k
+
+    def _hybrid_row_k(self, draft_stats: dict, bs: int) -> torch.Tensor:
+        """Protect an early prefix and choose one reachable uncertain row; otherwise use the next row.
+
+        The calibration is a reference-policy reach proxy. It uses only draft entropies,
+        never current target logits or realized acceptance. The final bonus row stays at base.
+        """
+        g = self._gate; B = int(self.block_size)
+        if g["cap"] >= B or g["protect"] >= B - 1:
+            raise ValueError("hybrid protected prefix/cap exceeds drafted block")
+        h = draft_stats["draft_entropy"].view(bs, B - 1)
+        table = self._hybrid_acceptance
+        uncertain = h > g["thr"]
+        acceptance = torch.where(uncertain, table[None, :, 1], table[None, :, 0])
+        reach = torch.cat((torch.ones((bs, 1), device=h.device),
+                           torch.cumprod(acceptance, dim=1)[:, :-1]), dim=1)
+        slot = torch.arange(1, B, device=h.device)[None, :]
+        eligible = uncertain & (slot > g["protect"]) & (slot <= g["cap"]) & (reach >= g["reach_min"])
+        selected = eligible & (torch.cumsum(eligible.to(torch.int32), dim=1) == 1)
+        selected[:, g["protect"]] |= ~eligible.any(dim=1)
+        escalated = (slot <= g["protect"]) | selected
+        k = torch.full((bs, B), g["base"], dtype=torch.int32, device=h.device)
+        k[:, :B - 1] = torch.where(escalated, g["esc"], g["base"])
         return k
 
     def init_cuda_graphs(self):
